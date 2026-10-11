@@ -1,3 +1,4 @@
+
 name: Build PyAV with minimal FFmpeg (Windows x64)
 
 on:
@@ -10,12 +11,14 @@ permissions:
   contents: write
 
 env:
-  FFMPEG_VERSION: "8.1.3"
-  FFMPEG_PREFIX: "C:\\ffmpeg-min\\install-8.1.3"
+  FFMPEG_VERSION: "9.0.2"
+  DAV1D_VERSION: "1.5.4"
+  FFMPEG_PREFIX: 'C:\ffmpeg-min\install-9.0.2'
 
 jobs:
   build:
     runs-on: windows-2022
+
     steps:
       - name: Check out PyAV source
         uses: actions/checkout@v7
@@ -25,14 +28,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      # FFmpeg's --toolchain=msvc requires the Visual Studio compiler/linker.
+      # FFmpeg and dav1d must use a compatible MSVC toolchain.
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Use MSYS2 for bash, make, tar, and nasm, while inheriting MSVC's environment.
+      # Use MSYS2 for Bash, make, tar, pkg-config and NASM.
       - name: Set up MSYS2
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MSYS
@@ -43,7 +47,184 @@ jobs:
             curl
             nasm
             xz
+            pkgconf
 
+      # Build dav1d as an MSVC shared library.
+      # Install it into the same prefix as FFmpeg.
+      - name: Build dav1d shared library
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:DAV1D_VERSION
+          $prefix = $env:FFMPEG_PREFIX
+          $work = $env:RUNNER_TEMP
+
+          $archive = Join-Path $work "dav1d-$version.tar.xz"
+          $source = Join-Path $work "dav1d-$version"
+          $build = Join-Path $work "dav1d-msvc-build"
+
+          # Verify the MSYS2 output from the preceding setup step.
+          if ([string]::IsNullOrWhiteSpace($env:MSYS2_LOCATION)) {
+            throw "MSYS2_LOCATION is empty. Check that the MSYS2 setup step has id: msys2."
+          }
+
+          $msysBin = Join-Path $env:MSYS2_LOCATION "usr\bin"
+
+          if (-not (Test-Path $msysBin)) {
+            throw "MSYS2 usr\bin directory not found: $msysBin"
+          }
+
+          # Keep the dav1d installation prefix clean.
+          if (Test-Path -LiteralPath $prefix) {
+            Remove-Item -LiteralPath $prefix -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force $prefix |
+            Out-Null
+
+          # Install Meson and Ninja for the Windows Python environment.
+          python -m pip install --upgrade meson ninja
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installing Meson and Ninja failed"
+          }
+
+          # Put MSVC first, followed by MSYS2 tools such as NASM.
+          # This prevents MSYS2 utilities from shadowing MSVC link.exe.
+          if (-not $env:VCToolsInstallDir) {
+            throw "VCToolsInstallDir is not set. Check the MSVC setup step."
+          }
+
+          $vcBin = Join-Path $env:VCToolsInstallDir "bin\Hostx64\x64"
+
+          if (-not (Test-Path $vcBin)) {
+            throw "MSVC compiler directory not found: $vcBin"
+          }
+
+          $env:PATH = "$vcBin;$msysBin;$env:PATH"
+
+          $nasmPath = Join-Path $msysBin "nasm.exe"
+
+          if (-not (Test-Path $nasmPath)) {
+            throw "NASM not found: $nasmPath. Check the MSYS2 nasm package."
+          }
+
+          Get-Command cl.exe | Out-Null
+
+          $linkCommand = Get-Command link.exe
+          $linkPath = [IO.Path]::GetFullPath($linkCommand.Source)
+          $expectedVcBin = [IO.Path]::GetFullPath($vcBin).TrimEnd('\') + '\'
+
+          if (-not $linkPath.StartsWith(
+              $expectedVcBin,
+              [StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw "link.exe is not resolving to MSVC: $linkPath"
+          }
+
+          Write-Host "MSVC linker: $linkPath"
+          Write-Host "NASM: $nasmPath"
+
+          & $nasmPath -v
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "NASM could not execute"
+          }
+
+          # Tell Meson to use the existing MSVC toolchain.
+          $env:CC = "cl"
+
+          # Download the dav1d source archive.
+          $url = "https://download.videolan.org/pub/videolan/dav1d/$version/dav1d-$version.tar.xz"
+
+          curl.exe --fail --location --retry 3 `
+            $url --output $archive
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Downloading dav1d failed"
+          }
+
+
+          # Extract source.
+          # MSYS2 tar requires POSIX paths such as /d/a/_temp/...
+          $cygpath = Join-Path $msysBin "cygpath.exe"
+          $tar = Join-Path $msysBin "tar.exe"
+
+          $archiveMsys = (& $cygpath -u $archive).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Converting the archive path to MSYS2 format failed"
+          }
+
+          $workMsys = (& $cygpath -u $work).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Converting the work directory to MSYS2 format failed"
+          }
+
+          & $tar -xf $archiveMsys -C $workMsys
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Extracting dav1d failed"
+          }
+
+          # Build a shared DLL and its MSVC import library.
+          meson setup $build $source `
+            "--prefix=$prefix" `
+            --libdir=lib `
+            --buildtype=release `
+            --default-library=shared `
+            -Denable_asm=true `
+            -Denable_tools=false `
+            -Denable_tests=false `
+            -Denable_examples=false
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "dav1d Meson configuration failed"
+          }
+
+          ninja -C $build
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Building dav1d failed"
+          }
+
+          ninja -C $build install
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installing dav1d failed"
+          }
+
+          # Verify the outputs needed by FFmpeg's configure step.
+          $pcFile = Join-Path $prefix "lib\pkgconfig\dav1d.pc"
+          $importLib = Join-Path $prefix "lib\dav1d.lib"
+          $dlls = @(Get-ChildItem -Path $prefix `
+            -Recurse -File -Filter "dav1d.dll")
+
+          if (-not (Test-Path $pcFile)) {
+            throw "dav1d pkg-config file was not installed: $pcFile"
+          }
+
+          if (-not (Test-Path $importLib)) {
+            throw "dav1d import library was not installed: $importLib"
+          }
+
+          if ($dlls.Count -eq 0) {
+            throw "dav1d.dll was not found under $prefix"
+          }
+
+          Write-Host "dav1d pkg-config: $pcFile"
+          Write-Host "dav1d import library: $importLib"
+
+          foreach ($dll in $dlls) {
+            Write-Host "dav1d runtime DLL: $($dll.FullName)"
+          }
+
+          Write-Host "dav1d shared library build completed."
+
+
+      # Build FFmpeg against the MSVC dav1d library.
       - name: Build FFmpeg shared libraries
         shell: msys2 {0}
         run: |
@@ -53,18 +234,36 @@ jobs:
           if [[ -n "${VCToolsInstallDir:-}" ]]; then
             export PATH="$(cygpath -u "$VCToolsInstallDir")/bin/Hostx64/x64:$PATH"
           fi
+
           command -v cl
           command -v link
+          command -v pkg-config
+          command -v nasm
+
+          prefix="/c/ffmpeg-min/install-${FFMPEG_VERSION}"
+
+          # Preserve dav1d installed by the previous step.
+          mkdir -p "$prefix"
+
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+          # Verify package discovery and inspect standard pkg-config flags.
+          pkg-config --exists --print-errors "dav1d >= 1.0.0"
+          pkg-config --modversion dav1d
+          pkg-config --cflags dav1d
+          pkg-config --libs dav1d
 
           curl --fail --location --retry 3 \
             "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
             --output "ffmpeg-${FFMPEG_VERSION}.tar.xz"
+
           tar -xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
           cd "ffmpeg-${FFMPEG_VERSION}"
 
           ./configure \
             --toolchain=msvc \
-            --prefix=/c/ffmpeg-min/install-8.1.3 \
+            --prefix="$prefix" \
+            --pkg-config=pkg-config \
             --disable-autodetect \
             --disable-everything \
             --disable-programs \
@@ -82,38 +281,42 @@ jobs:
             --enable-swscale \
             --enable-swresample \
             --enable-protocol=file \
-            --enable-demuxer=mov \
-            --enable-demuxer=gif \
-            --enable-demuxer=apng \
-            --enable-demuxer=webp \
-            --enable-demuxer=matroska \
-            --enable-decoder=h264 \
-            --enable-decoder=hevc \
-            --enable-decoder=av1 \
-            --enable-decoder=vp8 \
-            --enable-decoder=vp9 \
-            --enable-decoder=gif \
-            --enable-decoder=apng \
-            --enable-decoder=webp \
-            --enable-parser=h264 \
-            --enable-parser=hevc \
-            --enable-parser=av1 \
-            --enable-parser=vp9 \
-            --enable-filter=scale,fps,format
+            --enable-demuxer=mov,gif,webp_anim,matroska \
+            --enable-decoder=h264,hevc,libdav1d,vp8,vp9,gif,webp_anim,rawvideo \
+            --enable-parser=h264,hevc,av1,vp9,gif \
+            --enable-filter=scale,fps,format \
+            --enable-libdav1d
+
+          # Fail when a required component was not built.
+          for feature in \
+            MOV_DEMUXER GIF_DEMUXER WEBP_ANIM_DEMUXER MATROSKA_DEMUXER \
+            H264_DECODER HEVC_DECODER LIBDAV1D_DECODER \
+            VP8_DECODER VP9_DECODER GIF_DECODER \
+            WEBP_ANIM_DECODER RAWVIDEO_DECODER \
+            H264_PARSER HEVC_PARSER AV1_PARSER VP9_PARSER GIF_PARSER \
+            SCALE_FILTER FPS_FILTER FORMAT_FILTER
+          do
+            if ! grep -Eq "^#define CONFIG_${feature} 1$" config_components.h; then
+              echo "Required FFmpeg feature not enabled: ${feature}"
+              exit 1
+            fi
+          done
 
           make -j"$(nproc)"
           make install
 
-
       - name: Normalize FFmpeg import libraries
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $prefix = $env:FFMPEG_PREFIX
           $libDir = Join-Path $prefix "lib"
 
-          New-Item -ItemType Directory -Force $libDir | Out-Null
+          New-Item -ItemType Directory -Force $libDir |
+            Out-Null
 
-          # Find installed MSVC import libraries, including those in bin.
+          # Collect FFmpeg and dav1d MSVC import libraries.
           $importLibs = Get-ChildItem -Path $prefix `
             -Recurse -File -Filter "*.lib"
 
@@ -121,7 +324,6 @@ jobs:
             throw "No .lib files found in FFmpeg installation: $prefix"
           }
 
-          # PyAV expects the import libraries in the lib directory.
           foreach ($lib in $importLibs) {
             $destination = Join-Path $libDir $lib.Name
 
@@ -132,7 +334,6 @@ jobs:
             }
           }
 
-          # Fail early with a useful message if anything is missing.
           $required = @(
             "avcodec.lib",
             "avdevice.lib",
@@ -140,7 +341,8 @@ jobs:
             "avformat.lib",
             "avutil.lib",
             "swresample.lib",
-            "swscale.lib"
+            "swscale.lib",
+            "dav1d.lib"
           )
 
           $missing = @(
@@ -151,56 +353,117 @@ jobs:
 
           if ($missing.Count -gt 0) {
             Get-ChildItem -Path $prefix -Recurse -File |
-              Where-Object {
-                $_.Extension -in @(".lib", ".dll")
-              } |
+              Where-Object { $_.Extension -in @(".lib", ".dll") } |
               Select-Object -ExpandProperty FullName
 
-            throw "Missing FFmpeg import libraries: $($missing -join ', ')"
+            throw "Missing import libraries: $($missing -join ', ')"
           }
 
-          Write-Host "FFmpeg import libraries ready in $libDir"
-      
+          Write-Host "FFmpeg and dav1d import libraries ready: $libDir"
+
       - name: Build a PyAV wheel against the custom FFmpeg
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip setuptools wheel Cython delvewheel
-          python setup.py bdist_wheel "--ffmpeg-dir=$env:FFMPEG_PREFIX"
-          if ($LASTEXITCODE -ne 0) { throw "PyAV wheel build failed" }
+          python -m pip install --upgrade pip setuptools wheel Cython delvewheel pillow
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build dependency installation failed"
+          }
 
-          New-Item -ItemType Directory -Force wheelhouse | Out-Null
-          $wheel = Get-ChildItem dist\*.whl | Select-Object -First 1
-          if (-not $wheel) { throw "No PyAV wheel was produced" }
-          delvewheel repair --add-path "$env:FFMPEG_PREFIX\bin" -w wheelhouse $wheel.FullName
-          if ($LASTEXITCODE -ne 0) { throw "delvewheel repair failed" }
+          if (Test-Path dist) {
+            Remove-Item dist -Recurse -Force
+          }
+
+          python setup.py bdist_wheel "--ffmpeg-dir=$env:FFMPEG_PREFIX"
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyAV wheel build failed"
+          }
+
+          New-Item -ItemType Directory -Force wheelhouse |
+            Out-Null
+
+          Remove-Item wheelhouse\*.whl -Force `
+            -ErrorAction SilentlyContinue
+
+          $wheel = Get-ChildItem dist\*.whl |
+            Select-Object -First 1
+
+          if (-not $wheel) {
+            throw "No PyAV wheel was produced"
+          }
+
+          # Bundle the FFmpeg and dav1d runtime DLL dependencies.
+          delvewheel repair `
+            --add-path "$env:FFMPEG_PREFIX\bin" `
+            -w wheelhouse `
+            $wheel.FullName
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "delvewheel repair failed"
+          }
 
       - name: Package the FFmpeg SDK and DLLs
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $stage = Join-Path $env:RUNNER_TEMP "ffmpeg-sdk"
+
           New-Item -ItemType Directory -Force `
-            "$stage\bin", "$stage\include", "$stage\lib" | Out-Null
+            "$stage\bin", "$stage\include", "$stage\lib" |
+            Out-Null
 
-          Copy-Item "$env:FFMPEG_PREFIX\bin\*.dll" "$stage\bin\" -ErrorAction Stop
-          Copy-Item "$env:FFMPEG_PREFIX\lib\*.lib" "$stage\lib\" -ErrorAction Stop
-          Copy-Item "$env:FFMPEG_PREFIX\include\*" "$stage\include\" -Recurse -Force
-          Copy-Item "$env:GITHUB_WORKSPACE\ffmpeg-$($env:FFMPEG_VERSION)\COPYING.LGPLv2.1" $stage
+          # Includes dav1d.dll when installed in the shared prefix.
+          Copy-Item "$env:FFMPEG_PREFIX\bin\*.dll" `
+            "$stage\bin\" -ErrorAction Stop
 
-          $sdkZip = Join-Path $env:GITHUB_WORKSPACE "ffmpeg-$($env:FFMPEG_VERSION)-win_amd64-sdk.zip"
-          Compress-Archive -Path "$stage\*" -DestinationPath $sdkZip -Force
+          Copy-Item "$env:FFMPEG_PREFIX\lib\*.lib" `
+            "$stage\lib\" -ErrorAction Stop
+
+          Copy-Item "$env:FFMPEG_PREFIX\include\*" `
+            "$stage\include\" -Recurse -Force
+
+          $ffmpegLicense = Join-Path $env:GITHUB_WORKSPACE `
+            "ffmpeg-$($env:FFMPEG_VERSION)\COPYING.LGPLv2.1"
+
+          Copy-Item $ffmpegLicense `
+            (Join-Path $stage "COPYING.LGPLv2.1") `
+            -ErrorAction Stop
+
+          $dav1dLicense = Join-Path $env:RUNNER_TEMP `
+            "dav1d-$($env:DAV1D_VERSION)\COPYING"
+
+          Copy-Item $dav1dLicense `
+            (Join-Path $stage "COPYING.dav1d") `
+            -ErrorAction Stop
+
+          $sdkZip = Join-Path $env:GITHUB_WORKSPACE `
+            "ffmpeg-$($env:FFMPEG_VERSION)-win_amd64-sdk.zip"
+
+          Compress-Archive -Path "$stage\*" `
+            -DestinationPath $sdkZip -Force
 
       - name: Smoke-test the repaired wheel
         shell: pwsh
         run: |
-          $wheel = Get-ChildItem wheelhouse\*.whl | Select-Object -First 1
-          if (-not $wheel) { throw "No repaired wheel was produced" }
-          python -m pip install $wheel.FullName
-          if ($LASTEXITCODE -ne 0) { throw "Installing the wheel failed" }
+          $wheel = Get-ChildItem wheelhouse\*.whl |
+            Select-Object -First 1
 
-          # Leave the checkout so Python imports the installed wheel, not the source tree.
+          if (-not $wheel) {
+            throw "No repaired wheel was produced"
+          }
+
+          python -m pip install $wheel.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installing the wheel failed"
+          }
+
+          # Import the installed wheel outside the source checkout.
           Set-Location $env:RUNNER_TEMP
+
           python -c "import av; print('PyAV:', av.__version__); print('FFmpeg libraries:', av.library_versions)"
-          if ($LASTEXITCODE -ne 0) { throw "Importing the installed wheel failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Importing the installed wheel failed"
+          }
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
