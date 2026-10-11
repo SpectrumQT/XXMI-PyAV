@@ -94,6 +94,63 @@ jobs:
           make -j"$(nproc)"
           make install
 
+
+      - name: Normalize FFmpeg import libraries
+        shell: pwsh
+        run: |
+          $prefix = $env:FFMPEG_PREFIX
+          $libDir = Join-Path $prefix "lib"
+
+          New-Item -ItemType Directory -Force $libDir | Out-Null
+
+          # Find installed MSVC import libraries, including those in bin.
+          $importLibs = Get-ChildItem -Path $prefix `
+            -Recurse -File -Filter "*.lib"
+
+          if (-not $importLibs) {
+            throw "No .lib files found in FFmpeg installation: $prefix"
+          }
+
+          # PyAV expects the import libraries in the lib directory.
+          foreach ($lib in $importLibs) {
+            $destination = Join-Path $libDir $lib.Name
+
+            if ([IO.Path]::GetFullPath($lib.FullName) -ne
+                [IO.Path]::GetFullPath($destination)) {
+              Copy-Item -LiteralPath $lib.FullName `
+                -Destination $destination -Force
+            }
+          }
+
+          # Fail early with a useful message if anything is missing.
+          $required = @(
+            "avcodec.lib",
+            "avdevice.lib",
+            "avfilter.lib",
+            "avformat.lib",
+            "avutil.lib",
+            "swresample.lib",
+            "swscale.lib"
+          )
+
+          $missing = @(
+            $required | Where-Object {
+              -not (Test-Path (Join-Path $libDir $_))
+            }
+          )
+
+          if ($missing.Count -gt 0) {
+            Get-ChildItem -Path $prefix -Recurse -File |
+              Where-Object {
+                $_.Extension -in @(".lib", ".dll")
+              } |
+              Select-Object -ExpandProperty FullName
+
+            throw "Missing FFmpeg import libraries: $($missing -join ', ')"
+          }
+
+          Write-Host "FFmpeg import libraries ready in $libDir"
+      
       - name: Build a PyAV wheel against the custom FFmpeg
         shell: pwsh
         run: |
