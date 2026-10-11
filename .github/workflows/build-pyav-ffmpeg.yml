@@ -136,7 +136,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Importing the installed wheel failed" }
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v7
         with:
           name: pyav-ffmpeg-${{ env.FFMPEG_VERSION }}-win_amd64
           path: |
