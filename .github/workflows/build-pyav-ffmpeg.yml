@@ -82,13 +82,23 @@ jobs:
             --enable-swscale \
             --enable-swresample \
             --enable-protocol=file \
-            --enable-demuxer=mov,gif \
+            --enable-demuxer=mov \
+            --enable-demuxer=gif \
+            --enable-demuxer=apng \
+            --enable-demuxer=webp \
+            --enable-demuxer=matroska \
             --enable-decoder=h264 \
             --enable-decoder=hevc \
             --enable-decoder=av1 \
+            --enable-decoder=vp8 \
+            --enable-decoder=vp9 \
+            --enable-decoder=gif \
+            --enable-decoder=apng \
+            --enable-decoder=webp \
             --enable-parser=h264 \
             --enable-parser=hevc \
             --enable-parser=av1 \
+            --enable-parser=vp9 \
             --enable-filter=scale,fps,format
 
           make -j"$(nproc)"
